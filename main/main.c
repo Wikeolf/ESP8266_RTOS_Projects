@@ -132,27 +132,20 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-
-        /* --- 配网成功后关闭 SoftAP 和 HTTP Server --- */
-        ESP_LOGI(TAG, "Provisioning Done. Stopping SoftAP and WebServer...");
-
-        // 1. 停止 Web Server
+        /* --- 配网成功后重启 --- */
+        
+        // 只有当 server 不为 NULL 时，说明当前是配网模式
+        // 如果是正常 NVS 启动，server 是 NULL，不会进入此逻辑，从而避免死循环
         if (server) {
-            httpd_stop(server);
-            server = NULL;
-            ESP_LOGI(TAG, "Web server stopped");
+            ESP_LOGI(TAG, "Provisioning Successful! Restarting system to apply STA-only mode...");
+            
+            // 简单延时，确保串口日志打印完毕，并给浏览器一点时间接收 "Connecting..." 的响应
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            
+            // 直接重启
+            esp_restart();
         }
-
-        // 2. 切换 WiFi 模式为仅 Station (这会自动关闭 SoftAP 接口)
-        // 从 APSTA 切换到 STA 模式，AP 及其关联的连接将被移除，但 STA 连接保持不变
-        esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err == ESP_OK) {
-             ESP_LOGI(TAG, "Switched to STA mode (SoftAP disabled)");
-        } else {
-             ESP_LOGE(TAG, "Failed to switch mode: %s", esp_err_to_name(err));
-        }
-        /* --- 结束 --- */
-
+        /* ---------------------------- */
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "Failed to connect to router");
@@ -329,9 +322,6 @@ void app_main(void)
       ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-
-    //for dev
-    ESP_ERROR_CHECK(nvs_flash_erase());
 
     wifi_init_softap_sta();
     
