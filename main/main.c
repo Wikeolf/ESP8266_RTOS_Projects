@@ -82,9 +82,32 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+
+        /* --- 配网成功后关闭 SoftAP 和 HTTP Server --- */
+        ESP_LOGI(TAG, "Provisioning Done. Stopping SoftAP and WebServer...");
+
+        // 1. 停止 Web Server
+        if (server) {
+            httpd_stop(server);
+            server = NULL;
+            ESP_LOGI(TAG, "Web server stopped");
+        }
+
+        // 2. 切换 WiFi 模式为仅 Station (这会自动关闭 SoftAP 接口)
+        // 从 APSTA 切换到 STA 模式，AP 及其关联的连接将被移除，但 STA 连接保持不变
+        esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+        if (err == ESP_OK) {
+             ESP_LOGI(TAG, "Switched to STA mode (SoftAP disabled)");
+        } else {
+             ESP_LOGE(TAG, "Failed to switch mode: %s", esp_err_to_name(err));
+        }
+        /* --- 结束 --- */
+
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "Failed to connect to router");
+        // 注意：如果你需要在连接失败时自动重连，可以在这里调用 esp_wifi_connect()
+        // 但为了避免死循环，最好加上重试次数限制
     }
 }
 
@@ -121,11 +144,8 @@ esp_err_t root_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* * 核心修改部分 * */
 esp_err_t wifi_config_post_handler(httpd_req_t *req)
 {
-    // 1. 增加缓冲区大小，至少要比 content_len 大
-    // 为了安全，我们动态分配，或者设置一个足够大的静态值 (比如 512)
     int total_len = req->content_len;
     int cur_len = 0;
     char *buf = malloc(total_len + 1);
@@ -134,7 +154,6 @@ esp_err_t wifi_config_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     
-    // 2. 完整读取数据
     int received = 0;
     while (cur_len < total_len) {
         received = httpd_req_recv(req, buf + cur_len, total_len - cur_len);
@@ -151,18 +170,14 @@ esp_err_t wifi_config_post_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Received Raw Data: %s", buf);
 
-    // 3. 准备足够大的临时缓冲区来存放 URL 编码后的字符串
-    // URL 编码后的长度通常是原长度的3倍，所以我们给 100 字节肯定够用了
     char ssid_encoded[128] = {0}; 
     char password_encoded[128] = {0};
 
-    // 4. 解析参数 (注意：这里使用更大的 buffer 接收 encoded 字符串)
     if (httpd_query_key_value(buf, "ssid", ssid_encoded, sizeof(ssid_encoded)) == ESP_OK &&
         httpd_query_key_value(buf, "password", password_encoded, sizeof(password_encoded)) == ESP_OK) {
         
-        // 5. 进行 URL 解码
-        char ssid_decoded[33] = {0}; // Wi-Fi SSID 最大 32 字节 + 1 结束符
-        char password_decoded[65] = {0}; // Wi-Fi 密码最大 64 字节 + 1 结束符
+        char ssid_decoded[33] = {0};
+        char password_decoded[65] = {0};
 
         url_decode(ssid_decoded, ssid_encoded);
         url_decode(password_decoded, password_encoded);
@@ -171,7 +186,6 @@ esp_err_t wifi_config_post_handler(httpd_req_t *req)
         ESP_LOGI(TAG, "Decoded Password: %s", password_decoded);
 
         wifi_config_t wifi_config = {0};
-        // 确保不会溢出
         strncpy((char*)wifi_config.sta.ssid, ssid_decoded, sizeof(wifi_config.sta.ssid)); 
         strncpy((char*)wifi_config.sta.password, password_decoded, sizeof(wifi_config.sta.password));
         
@@ -187,7 +201,7 @@ esp_err_t wifi_config_post_handler(httpd_req_t *req)
         httpd_resp_send(req, resp_str, strlen(resp_str));
     }
 
-    free(buf); // 别忘了释放内存
+    free(buf); 
     return ESP_OK;
 }
 
@@ -208,9 +222,8 @@ httpd_uri_t config_uri = {
 void start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    // 增加 URI 匹配长度和头部长度限制，防止某些浏览器发送超长请求导致问题
     config.max_uri_handlers = 8;
-    config.stack_size = 8192; // 增加栈大小，防止处理长字符串时栈溢出
+    config.stack_size = 8192; 
 
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
