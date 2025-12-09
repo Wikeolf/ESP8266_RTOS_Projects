@@ -1,10 +1,10 @@
-/* * ESP32 SoftAP + HTTP Server 配网示例
- * 基于 ESP-IDF softAP 和 http_server simple 示例合并开发
+/* * ESP8266 SoftAP + HTTP Server 配网示例
+ * 基于 ESP8266_RTOS_SDK SoftAP 和 http_server simple 示例合并开发
  */
 
 #include <string.h>
 #include <stdlib.h>
-#include <ctype.h> // 需要这个头文件支持 URL 解码
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -19,7 +19,7 @@
 
 #define TAG "SoftAP_Prov"
 
-#define AP_SSID "ESP32_Config"
+#define AP_SSID "ESP8266_Config"
 #define AP_PASS "" 
 
 #define FLASH_BUTTON_GPIO GPIO_NUM_0
@@ -27,25 +27,24 @@
 
 void start_webserver();
 
-/* * 嵌入的 HTML 页面 
- * 1. 增加了 maxlength 属性，利用浏览器原生限制输入长度
- * 2. 增加了 JavaScript 脚本，在提交前再次校验
- */
 const char* index_html = 
     "<!DOCTYPE html>"
     "<html>"
     "<head>"
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
     "<meta charset=\"UTF-8\">"
-    "<title>ESP32 Config</title>"
+    "<title>ESP8266 Config</title>"
     "<style>"
     "  body { font-family: sans-serif; padding: 20px; }"
     "  input { padding: 5px; margin: 5px 0; width: 100%; box-sizing: border-box; }"
+    "  .advanced { margin-top: 15px; padding: 10px; border: 1px solid #ccc; background: #f9f9f9; }"
     "</style>"
     "<script>"
     "  function validateForm() {"
     "    var ssid = document.getElementById('ssid').value;"
     "    var pass = document.getElementById('password').value;"
+    "    var bssidCheck = document.getElementById('bssid_enable').checked;"
+    "    var bssid = document.getElementById('bssid').value;"
     "    if (ssid.length == 0) {"
     "      alert('SSID cannot be empty');"
     "      return false;"
@@ -58,7 +57,19 @@ const char* index_html =
     "      alert('Password too long (max 63 chars)');"
     "      return false;"
     "    }"
+    "    if (bssidCheck) {"
+    "      var macRegex = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/;"
+    "      if (!macRegex.test(bssid)) {"
+    "        alert('Invalid BSSID format (e.g., AA:BB:CC:DD:EE:FF)');"
+    "        return false;"
+    "      }"
+    "    }"
     "    return true;"
+    "  }"
+    "  function toggleAdvanced() {"
+    "    var div = document.getElementById('bssid_div');"
+    "    var check = document.getElementById('bssid_enable');"
+    "    div.style.display = check.checked ? 'block' : 'none';"
     "  }"
     "</script>"
     "</head>"
@@ -66,12 +77,20 @@ const char* index_html =
     "<h2>WiFi Configuration</h2>"
     "<form action=\"/config\" method=\"post\" onsubmit=\"return validateForm()\">"
     "SSID:<br>"
-    /* 添加 maxlength=32 限制前端输入长度 */
     "<input type=\"text\" id=\"ssid\" name=\"ssid\" maxlength=\"32\" placeholder=\"Enter SSID\"><br>"
     "Password:<br>"
-    /* 添加 maxlength=63 限制前端输入长度 */
-    "<input type=\"text\" id=\"password\" name=\"password\" maxlength=\"63\" placeholder=\"Enter Password\"><br><br>"
-    "<input type=\"submit\" value=\"Connect\">"
+    "<input type=\"text\" id=\"password\" name=\"password\" maxlength=\"63\" placeholder=\"Enter Password\"><br>"
+    
+    "<div class=\"advanced\">"
+    "  <strong>Advanced Settings</strong><br>"
+    "  <label><input type=\"checkbox\" id=\"bssid_enable\" name=\"bssid_enable\" onclick=\"toggleAdvanced()\"> Lock BSSID (Optional)</label>"
+    "  <div id=\"bssid_div\" style=\"display:none\">"
+    "    BSSID (XX:XX:XX:XX:XX:XX):<br>"
+    "    <input type=\"text\" id=\"bssid\" name=\"bssid\" maxlength=\"17\" placeholder=\"AA:BB:CC:DD:EE:FF\">"
+    "  </div>"
+    "</div>"
+    
+    "<br><input type=\"submit\" value=\"Connect\">"
     "</form>"
     "</body>"
     "</html>";
@@ -112,6 +131,22 @@ void url_decode(char *dst, const char *src, size_t dst_len)
         written++;
     }
     *dst = '\0'; // 确保必定以 null 结尾
+}
+
+/* 解析 MAC 地址字符串 (XX:XX:XX:XX:XX:XX) 到 uint8_t 数组 */
+bool parse_mac_address(const char *str, uint8_t mac[6])
+{
+    unsigned int bytes[6];
+    int count = sscanf(str, "%x:%x:%x:%x:%x:%x", 
+                       &bytes[0], &bytes[1], &bytes[2], 
+                       &bytes[3], &bytes[4], &bytes[5]);
+    if (count == 6) {
+        for (int i = 0; i < 6; i++) {
+            mac[i] = (uint8_t)bytes[i];
+        }
+        return true;
+    }
+    return false;
 }
 
 /* --- 物理按键监测任务 (适配 FLASH 按键) --- */
@@ -231,7 +266,9 @@ void wifi_init_softap_sta(void)
 
      if (wifi_config.sta.ssid[0] != 0) {
         ESP_LOGI(TAG, "NVS config found (SSID: %s). Starting in STA Mode.", wifi_config.sta.ssid);
-        
+        if (wifi_config.sta.bssid_set) {
+            ESP_LOGI(TAG, "Locking to BSSID: "MACSTR, MAC2STR(wifi_config.sta.bssid));
+        }
         // 1. 设置为仅 Station 模式
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         // 2. 启动 WiFi (会自动触发 WIFI_EVENT_STA_START -> esp_wifi_connect)
@@ -303,14 +340,16 @@ esp_err_t wifi_config_post_handler(httpd_req_t *req)
 
     char ssid_encoded[128] = {0}; 
     char password_encoded[128] = {0};
-    
-    //解析表单数据
+    char bssid_encoded[64] = {0};
+    char bssid_enable[10] = {0};
+
+    // 只要有 SSID 和 Password 就认为是有效请求，BSSID 是可选的
     if (httpd_query_key_value(buf, "ssid", ssid_encoded, sizeof(ssid_encoded)) == ESP_OK &&
         httpd_query_key_value(buf, "password", password_encoded, sizeof(password_encoded)) == ESP_OK) {
         
         char ssid_decoded[33] = {0};
         char password_decoded[65] = {0};
-        //进行 URL 解码
+
         url_decode(ssid_decoded, ssid_encoded, sizeof(ssid_decoded));
         url_decode(password_decoded, password_encoded, sizeof(password_decoded));
 
@@ -321,6 +360,25 @@ esp_err_t wifi_config_post_handler(httpd_req_t *req)
         wifi_config_t wifi_config = {0};
         strncpy((char*)wifi_config.sta.ssid, ssid_decoded, sizeof(wifi_config.sta.ssid)); 
         strncpy((char*)wifi_config.sta.password, password_decoded, sizeof(wifi_config.sta.password));
+        
+        /* --- 处理 BSSID 锁定逻辑 --- */
+        // 检查 checkbox 是否勾选 (HTML checkbox 选中时会发送 "bssid_enable=on"，否则不发送)
+        if (httpd_query_key_value(buf, "bssid_enable", bssid_enable, sizeof(bssid_enable)) == ESP_OK &&
+            strcmp(bssid_enable, "on") == 0) {
+            
+            if (httpd_query_key_value(buf, "bssid", bssid_encoded, sizeof(bssid_encoded)) == ESP_OK) {
+                char bssid_decoded[20] = {0};
+                url_decode(bssid_decoded, bssid_encoded, sizeof(bssid_decoded));
+                
+                // 解析 MAC 地址
+                if (parse_mac_address(bssid_decoded, wifi_config.sta.bssid)) {
+                    wifi_config.sta.bssid_set = true;
+                    ESP_LOGI(TAG, "BSSID Locking Enabled: "MACSTR, MAC2STR(wifi_config.sta.bssid));
+                } else {
+                    ESP_LOGW(TAG, "Invalid BSSID format received, ignoring lock.");
+                }
+            }
+        }
         
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         
