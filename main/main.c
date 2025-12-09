@@ -21,6 +21,8 @@
 #define AP_SSID "ESP32_Config"
 #define AP_PASS "" 
 
+void start_webserver();
+
 /* * 嵌入的 HTML 页面 
  * 1. 增加了 maxlength 属性，利用浏览器原生限制输入长度
  * 2. 增加了 JavaScript 脚本，在提交前再次校验
@@ -174,24 +176,43 @@ void wifi_init_softap_sta(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
-    //配置SoftAP参数
-    wifi_config_t ap_config = {
-        .ap = {
-            .ssid = AP_SSID,
-            .ssid_len = strlen(AP_SSID),
-            .password = AP_PASS,
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN,
-            .channel = 1
-        },
-    };
+    /* --- NVS 检查逻辑 --- */
+    wifi_config_t wifi_config;
+    // 从 NVS 加载当前配置到 RAM
+    ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
 
-    //设置WiFi工作模式为AP+STA
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    //设置SoftAP配置
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-    //启动WiFi
-    ESP_ERROR_CHECK(esp_wifi_start());
+     if (wifi_config.sta.ssid[0] != 0) {
+        ESP_LOGI(TAG, "NVS config found (SSID: %s). Starting in STA Mode.", wifi_config.sta.ssid);
+        
+        // 1. 设置为仅 Station 模式
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        // 2. 启动 WiFi (会自动触发 WIFI_EVENT_STA_START -> esp_wifi_connect)
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }else {
+         ESP_LOGI(TAG, "No NVS config found. Starting in AP+STA Mode for Provisioning.");
+         //配置SoftAP参数
+         wifi_config_t ap_config = {
+             .ap = {
+                 .ssid = AP_SSID,
+                 .ssid_len = strlen(AP_SSID),
+                 .password = AP_PASS,
+                 .max_connection = 4,
+                 .authmode = WIFI_AUTH_OPEN,
+                 .channel = 1
+             },
+         };
+         //设置WiFi工作模式为AP+STA
+         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+         //设置SoftAP配置
+         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+         //启动WiFi
+         ESP_ERROR_CHECK(esp_wifi_start());
+
+         //启动WebServer
+         start_webserver();
+        ESP_LOGI(TAG, "SoftAP '%s' started. Connect to configure WiFi.", AP_SSID);
+    }
+
 }
 
 // 辅助函数：处理根目录的 GET 请求，返回 HTML 页面
@@ -285,7 +306,7 @@ httpd_uri_t config_uri = {
     .user_ctx  = NULL
 };
 
-void start_webserver(void)
+void start_webserver()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
@@ -309,8 +330,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    //for dev
+    ESP_ERROR_CHECK(nvs_flash_erase());
+
     wifi_init_softap_sta();
-    start_webserver();
     
-    ESP_LOGI(TAG, "System ready. Connect to AP 'ESP32_Config' and visit 192.168.4.1");
+    ESP_LOGI(TAG, "System ready.");
 }
