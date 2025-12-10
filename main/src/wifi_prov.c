@@ -2,6 +2,9 @@
 #include "utils.h"
 
 #include <string.h>
+#include <stdlib.h> // for malloc
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -18,7 +21,9 @@ static httpd_handle_t server = NULL;
 // 当前重连计数
 static int s_retry_num = 0;
 
-/* HTML 内容 */
+/* * 前端页面 HTML 
+ * 新增了 scanWifi() JS 函数和 scanBtn 按钮 
+ */
 const char* index_html = 
     "<!DOCTYPE html>"
     "<html>"
@@ -27,9 +32,12 @@ const char* index_html =
     "<meta charset=\"UTF-8\">"
     "<title>ESP8266 Config</title>"
     "<style>"
-    "  body { font-family: sans-serif; padding: 20px; }"
-    "  input { padding: 5px; margin: 5px 0; width: 100%; box-sizing: border-box; }"
+    "  body { font-family: sans-serif; padding: 20px; max-width: 400px; margin: 0 auto; }"
+    "  input, select, button { padding: 10px; margin: 5px 0; width: 100%; box-sizing: border-box; }"
+    "  button { background-color: #007bff; color: white; border: none; cursor: pointer; }"
+    "  button:disabled { background-color: #ccc; }"
     "  .advanced { margin-top: 15px; padding: 10px; border: 1px solid #ccc; background: #f9f9f9; }"
+    "  #scan_res { display: none; }"
     "</style>"
     "<script>"
     "  function validateForm() {"
@@ -51,13 +59,46 @@ const char* index_html =
     "    var check = document.getElementById('bssid_enable');"
     "    div.style.display = check.checked ? 'block' : 'none';"
     "  }"
+    "  function scanWifi() {"
+    "    var btn = document.getElementById('scanBtn');"
+    "    var sel = document.getElementById('scan_res');"
+    "    btn.disabled = true;"
+    "    btn.innerText = 'Scanning...';"
+    "    fetch('/scan').then(res => res.json()).then(data => {"
+    "       sel.innerHTML = '<option value=\"\">-- Select Network --</option>';"
+    "       data.forEach(ap => {"
+    "         var opt = document.createElement('option');"
+    "         opt.value = ap.ssid;"
+    "         opt.innerText = ap.ssid + ' (' + ap.rssi + 'dBm)' + (ap.auth==0?'':' 🔒');"
+    "         sel.appendChild(opt);"
+    "       });"
+    "       sel.style.display = 'block';"
+    "       btn.disabled = false;"
+    "       btn.innerText = 'Rescan';"
+    "    }).catch(e => {"
+    "       alert('Scan failed: ' + e);"
+    "       btn.disabled = false;"
+    "       btn.innerText = 'Scan WiFi';"
+    "    });"
+    "  }"
+    "  function selectWifi() {"
+    "     var sel = document.getElementById('scan_res');"
+    "     if(sel.value) document.getElementById('ssid').value = sel.value;"
+    "  }"
     "</script>"
     "</head>"
     "<body>"
     "<h2>WiFi Configuration</h2>"
     "<form action=\"/config\" method=\"post\" onsubmit=\"return validateForm()\">"
-    "SSID:<br><input type=\"text\" id=\"ssid\" name=\"ssid\" maxlength=\"32\" placeholder=\"Enter SSID\"><br>"
+    
+    "SSID:<br>"
+    "<input type=\"text\" id=\"ssid\" name=\"ssid\" maxlength=\"32\" placeholder=\"Enter SSID\">"
+    "<button type=\"button\" id=\"scanBtn\" onclick=\"scanWifi()\">Scan Networks</button>"
+    "<select id=\"scan_res\" onchange=\"selectWifi()\"></select>"
+    "<br>"
+    
     "Password:<br><input type=\"text\" id=\"password\" name=\"password\" maxlength=\"63\" placeholder=\"Enter Password\"><br>"
+    
     "<div class=\"advanced\">"
     "  <strong>Advanced Settings</strong><br>"
     "  <label><input type=\"checkbox\" id=\"bssid_enable\" name=\"bssid_enable\" onclick=\"toggleAdvanced()\"> Lock BSSID</label>"
@@ -65,6 +106,7 @@ const char* index_html =
     "    BSSID:<br><input type=\"text\" id=\"bssid\" name=\"bssid\" maxlength=\"17\" placeholder=\"AA:BB:CC:DD:EE:FF\">"
     "  </div>"
     "</div>"
+    
     "<br><input type=\"submit\" value=\"Connect\">"
     "</form>"
     "</body>"
@@ -110,28 +152,105 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             // Retry 2: 3000ms
             // Retry 3: 4500ms ...
             int delay_ms = s_retry_num * 1500;
-            
-            ESP_LOGI(TAG, "Retry to connect to the AP (%d/%d) after %d ms", s_retry_num, MAX_RETRY, delay_ms);
-            
-            // 阻塞等待延迟 (注意：长时间阻塞 Event Loop 可能影响其他 WiFi 事件，但断网状态下通常影响不大)
+            ESP_LOGI(TAG, "Retry connect (%d/%d) after %d ms", s_retry_num, MAX_RETRY, delay_ms);
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
             
             esp_wifi_connect();
         } else {
-            ESP_LOGE(TAG, "Connect to the AP failed. Maximum retries reached.");
-            // 达到最大重试次数，可以在这里决定是保持静默，还是重启进入配网模式
+            ESP_LOGE(TAG, "Connect failed. Max retries reached.");
         }
     }
 }
 
-/* HTTP GET Handler */
+/* HTTP GET Handler - 返回配网页面 */
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     httpd_resp_send(req, index_html, strlen(index_html));
     return ESP_OK;
 }
 
-/* HTTP POST Handler */
+/* * HTTP GET Handler - 执行 WiFi 扫描并返回 JSON 
+ * 响应格式: [{"ssid":"ABC","rssi":-50,"auth":3}, ...]
+ */
+static esp_err_t scan_get_handler(httpd_req_t *req)
+{
+    // 配置扫描参数 (block=true 表示阻塞直到扫描完成)
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true
+    };
+    
+    // 开始扫描 (阻塞模式)
+    ESP_LOGI(TAG, "Starting WiFi Scan...");
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Scan failed (0x%x)", err);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    ESP_LOGI(TAG, "Found %d APs", ap_count);
+
+    if (ap_count == 0) {
+        httpd_resp_send(req, "[]", 2);
+        return ESP_OK;
+    }
+
+    // 限制最大处理数量以防止内存溢出
+    if (ap_count > 20) ap_count = 20;
+
+    wifi_ap_record_t *ap_list = (wifi_ap_record_t *)malloc(ap_count * sizeof(wifi_ap_record_t));
+    if (!ap_list) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
+
+    // 构建 JSON 字符串 (手动构建以减少对 cJSON 的依赖)
+    // 估算缓冲区大小: 每个 AP 约 64 字节 (SSID 32 + 其他字段 + 格式字符)
+    char *json_buf = malloc(ap_count * 80 + 10); 
+    if (!json_buf) {
+        free(ap_list);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char *ptr = json_buf;
+    ptr += sprintf(ptr, "[");
+
+    for (int i = 0; i < ap_count; i++) {
+        // 过滤空 SSID
+        if (strlen((char *)ap_list[i].ssid) == 0) continue;
+
+        ptr += sprintf(ptr, "{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}", 
+                       ap_list[i].ssid, ap_list[i].rssi, ap_list[i].authmode);
+        
+        if (i < ap_count - 1) {
+            ptr += sprintf(ptr, ",");
+        }
+    }
+    // 处理最后一个可能的逗号 (如果最后一个被过滤了，可能有尾部逗号问题，简易处理如下)
+    if (*(ptr - 1) == ',') {
+        ptr--; // 回退覆盖最后的逗号
+    }
+
+    ptr += sprintf(ptr, "]");
+    
+    // 发送响应
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_buf, strlen(json_buf));
+
+    free(json_buf);
+    free(ap_list);
+    return ESP_OK;
+}
+
+/* HTTP POST Handler - 保存配置 */
 static esp_err_t wifi_config_post_handler(httpd_req_t *req)
 {
     int total_len = req->content_len;
@@ -203,6 +322,7 @@ static esp_err_t wifi_config_post_handler(httpd_req_t *req)
 
 /* 注册 URI */
 static const httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
+static const httpd_uri_t scan_uri = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler, .user_ctx = NULL };
 static const httpd_uri_t config_uri = { .uri = "/config", .method = HTTP_POST, .handler = wifi_config_post_handler, .user_ctx = NULL };
 
 static void start_webserver()
@@ -213,6 +333,7 @@ static void start_webserver()
     ESP_LOGI(TAG, "Starting webserver on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &root_uri);
+        httpd_register_uri_handler(server, &scan_uri); // 注册扫描接口
         httpd_register_uri_handler(server, &config_uri);
     }
 }
