@@ -13,6 +13,11 @@
 static const char *TAG = "WiFi_Prov";
 static httpd_handle_t server = NULL;
 
+// 最大重连次数
+#define MAX_RETRY 5
+// 当前重连计数
+static int s_retry_num = 0;
+
 /* HTML 内容 */
 const char* index_html = 
     "<!DOCTYPE html>"
@@ -84,11 +89,37 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         
+        // 连接成功，重置重试计数器
+        s_retry_num = 0;
+
         // 如果 Server 存在，说明是从配网模式连接成功的，需要重启进入纯 STA 模式
         if (server) {
             ESP_LOGI(TAG, "Provisioning Successful! Restarting...");
             vTaskDelay(pdMS_TO_TICKS(1000));
             esp_restart();
+        }
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        // 自动重连逻辑
+        if (s_retry_num < MAX_RETRY) {
+            s_retry_num++;
+            
+            // 采用线性退避策略 (Linear Backoff)
+            // 每次重试增加 1500ms 延迟
+            // Retry 1: 1500ms
+            // Retry 2: 3000ms
+            // Retry 3: 4500ms ...
+            int delay_ms = s_retry_num * 1500;
+            
+            ESP_LOGI(TAG, "Retry to connect to the AP (%d/%d) after %d ms", s_retry_num, MAX_RETRY, delay_ms);
+            
+            // 阻塞等待延迟 (注意：长时间阻塞 Event Loop 可能影响其他 WiFi 事件，但断网状态下通常影响不大)
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            
+            esp_wifi_connect();
+        } else {
+            ESP_LOGE(TAG, "Connect to the AP failed. Maximum retries reached.");
+            // 达到最大重试次数，可以在这里决定是保持静默，还是重启进入配网模式
         }
     }
 }
@@ -155,6 +186,9 @@ static esp_err_t wifi_config_post_handler(httpd_req_t *req)
         
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         ESP_LOGI(TAG, "Connecting to router...");
+        
+        // 收到新配置时，重置重试计数器，给新密码 5 次机会
+        s_retry_num = 0;
         esp_wifi_connect();
         
         const char *resp_str = "Connecting... Please check device status.";
