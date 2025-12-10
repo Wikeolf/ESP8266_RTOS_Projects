@@ -264,16 +264,18 @@ void wifi_init_softap_sta(void)
     // 从 NVS 加载当前配置到 RAM
     ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &wifi_config));
 
-     if (wifi_config.sta.ssid[0] != 0) {
+    if (wifi_config.sta.ssid[0] != 0) {
         ESP_LOGI(TAG, "NVS config found (SSID: %s). Starting in STA Mode.", wifi_config.sta.ssid);
         if (wifi_config.sta.bssid_set) {
             ESP_LOGI(TAG, "Locking to BSSID: "MACSTR, MAC2STR(wifi_config.sta.bssid));
         }
         // 1. 设置为仅 Station 模式
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        // 2. 启动 WiFi (会自动触发 WIFI_EVENT_STA_START -> esp_wifi_connect)
+        // 2. 启动 WiFi
         ESP_ERROR_CHECK(esp_wifi_start());
-    }else {
+        ESP_ERROR_CHECK(esp_wifi_connect());
+    }
+    else {
          ESP_LOGI(TAG, "No NVS config found. Starting in AP+STA Mode for Provisioning.");
          //配置SoftAP参数
          wifi_config_t ap_config = {
