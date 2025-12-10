@@ -23,6 +23,7 @@ static int s_retry_num = 0;
 
 /* * 前端页面 HTML 
  * 新增了 scanWifi() JS 函数和 scanBtn 按钮 
+ * 优化: 信号强度 Emoji 显示 + BSSID 显示 + 自动填充 BSSID
  */
 const char* index_html = 
     "<!DOCTYPE html>"
@@ -37,7 +38,7 @@ const char* index_html =
     "  button { background-color: #007bff; color: white; border: none; cursor: pointer; }"
     "  button:disabled { background-color: #ccc; }"
     "  .advanced { margin-top: 15px; padding: 10px; border: 1px solid #ccc; background: #f9f9f9; }"
-    "  #scan_res { display: none; }"
+    "  #scan_res { display: none; margin-top: 5px; }"
     "</style>"
     "<script>"
     "  function validateForm() {"
@@ -59,6 +60,12 @@ const char* index_html =
     "    var check = document.getElementById('bssid_enable');"
     "    div.style.display = check.checked ? 'block' : 'none';"
     "  }"
+    "  function getSignalEmoji(rssi) {"
+    "    if (rssi >= -55) return '🟢';" // Excellent
+    "    if (rssi >= -75) return '🟡';" // Good
+    "    if (rssi >= -85) return '🟠';" // Fair
+    "    return '🔴';"                 // Weak
+    "  }"
     "  function scanWifi() {"
     "    var btn = document.getElementById('scanBtn');"
     "    var sel = document.getElementById('scan_res');"
@@ -69,7 +76,12 @@ const char* index_html =
     "       data.forEach(ap => {"
     "         var opt = document.createElement('option');"
     "         opt.value = ap.ssid;"
-    "         opt.innerText = ap.ssid + ' (' + ap.rssi + 'dBm)' + (ap.auth==0?'':' 🔒');"
+    "         /* 将 BSSID 存入 dataset 以便选择时读取 */"
+    "         opt.dataset.bssid = ap.bssid;" 
+    "         var lock = ap.auth == 0 ? '' : '🔒';"
+    "         var emoji = getSignalEmoji(ap.rssi);"
+    "         /* 显示格式: 🟢 SSID (-50dBm) [MAC] 🔒 */"
+    "         opt.innerText = emoji + ' ' + ap.ssid + ' (' + ap.rssi + 'dBm) [' + ap.bssid + '] ' + lock;"
     "         sel.appendChild(opt);"
     "       });"
     "       sel.style.display = 'block';"
@@ -83,7 +95,14 @@ const char* index_html =
     "  }"
     "  function selectWifi() {"
     "     var sel = document.getElementById('scan_res');"
-    "     if(sel.value) document.getElementById('ssid').value = sel.value;"
+    "     var selectedOpt = sel.options[sel.selectedIndex];"
+    "     if(sel.value) {"
+    "       document.getElementById('ssid').value = sel.value;"
+    "       /* 如果存在 BSSID 且用户开启了锁定功能(或为了方便用户查看)，尝试填充 */"
+    "       if (selectedOpt.dataset.bssid) {"
+    "          document.getElementById('bssid').value = selectedOpt.dataset.bssid;"
+    "       }"
+    "     }"
     "  }"
     "</script>"
     "</head>"
@@ -103,7 +122,8 @@ const char* index_html =
     "  <strong>Advanced Settings</strong><br>"
     "  <label><input type=\"checkbox\" id=\"bssid_enable\" name=\"bssid_enable\" onclick=\"toggleAdvanced()\"> Lock BSSID</label>"
     "  <div id=\"bssid_div\" style=\"display:none\">"
-    "    BSSID:<br><input type=\"text\" id=\"bssid\" name=\"bssid\" maxlength=\"17\" placeholder=\"AA:BB:CC:DD:EE:FF\">"
+    "    BSSID (Auto-filled from scan):<br>"
+    "    <input type=\"text\" id=\"bssid\" name=\"bssid\" maxlength=\"17\" placeholder=\"AA:BB:CC:DD:EE:FF\">"
     "  </div>"
     "</div>"
     
@@ -130,11 +150,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        
-        // 连接成功，重置重试计数器
-        s_retry_num = 0;
-
-        // 如果 Server 存在，说明是从配网模式连接成功的，需要重启进入纯 STA 模式
+        s_retry_num = 0; // 成功连接，重置重试计数
         if (server) {
             ESP_LOGI(TAG, "Provisioning Successful! Restarting...");
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -170,7 +186,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 }
 
 /* * HTTP GET Handler - 执行 WiFi 扫描并返回 JSON 
- * 响应格式: [{"ssid":"ABC","rssi":-50,"auth":3}, ...]
+ * 响应格式: [{"ssid":"ABC","rssi":-50,"auth":3,"bssid":"xx:xx..."}, ...]
  */
 static esp_err_t scan_get_handler(httpd_req_t *req)
 {
@@ -211,9 +227,13 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
 
     ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
 
-    // 构建 JSON 字符串 (手动构建以减少对 cJSON 的依赖)
-    // 估算缓冲区大小: 每个 AP 约 64 字节 (SSID 32 + 其他字段 + 格式字符)
-    char *json_buf = malloc(ap_count * 80 + 10); 
+    // 构建 JSON 字符串
+    // 估算缓冲区大小: 
+    // 每个 AP 约: 
+    // {"ssid":"...","rssi":-xx,"auth":x,"bssid":"xx:xx:xx:xx:xx:xx"}
+    // SSID(32) + RSSI(5) + Auth(3) + BSSID(19) + Keys/Quotes(40) ~= 100 bytes
+    // 安全起见给 128 bytes/AP
+    char *json_buf = malloc(ap_count * 128 + 10); 
     if (!json_buf) {
         free(ap_list);
         httpd_resp_send_500(req);
@@ -227,16 +247,18 @@ static esp_err_t scan_get_handler(httpd_req_t *req)
         // 过滤空 SSID
         if (strlen((char *)ap_list[i].ssid) == 0) continue;
 
-        ptr += sprintf(ptr, "{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d}", 
-                       ap_list[i].ssid, ap_list[i].rssi, ap_list[i].authmode);
+        ptr += sprintf(ptr, "{\"ssid\":\"%s\",\"rssi\":%d,\"auth\":%d,\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\"}", 
+                       ap_list[i].ssid, ap_list[i].rssi, ap_list[i].authmode,
+                       ap_list[i].bssid[0], ap_list[i].bssid[1], ap_list[i].bssid[2],
+                       ap_list[i].bssid[3], ap_list[i].bssid[4], ap_list[i].bssid[5]);
         
         if (i < ap_count - 1) {
             ptr += sprintf(ptr, ",");
         }
     }
-    // 处理最后一个可能的逗号 (如果最后一个被过滤了，可能有尾部逗号问题，简易处理如下)
+    // 处理最后一个可能的逗号
     if (*(ptr - 1) == ',') {
-        ptr--; // 回退覆盖最后的逗号
+        ptr--; 
     }
 
     ptr += sprintf(ptr, "]");
@@ -328,7 +350,6 @@ static const httpd_uri_t config_uri = { .uri = "/config", .method = HTTP_POST, .
 static void start_webserver()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
     
     ESP_LOGI(TAG, "Starting webserver on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
