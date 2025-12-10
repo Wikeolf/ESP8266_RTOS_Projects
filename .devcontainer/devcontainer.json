@@ -1,0 +1,30 @@
+{
+    /* 在 UI 中显示的开发容器名称 */
+    "name": "Ubuntu-ESP8266-RTOS_SDK",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    /* 将 VS Code 扩展挂载到目标路径，重建容器时无需再次安装这些扩展*/
+    "mounts": [
+        "source=extensionCache,target=/root/.vscode-server/extensions,type=volume"
+    ],
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "bash",
+                // 自动设置 IDF_PATH，确保终端和插件能找到 SDK
+                "terminal.integrated.env.linux": {
+                    "IDF_PATH": "/opt/esp/ESP8266_RTOS_SDK"
+                }
+            },
+            "extensions": [
+                "ms-vscode.cpptools"
+            ]
+        }
+    },
+    "runArgs": [
+        "--privileged",
+        "--device=/dev/ttyUSB0"
+    ],
+	"remoteUser": "vscode"
+}
