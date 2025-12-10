@@ -8,6 +8,7 @@
 // 引入自定义模块
 #include "wifi_prov.h"
 #include "peripherals.h"
+#include "tcp_bridge.h"
 
 static const char *TAG = "Main";
 
@@ -30,5 +31,13 @@ void app_main(void)
     // 3. 启动 WiFi 逻辑 (根据 NVS 自动决定是 STA 还是 配网模式)
     wifi_init_softap_sta();
     
+    // 4. 启动 TCP 串口 透传服务
+    // 将 D7(RX) / D8(TX) 转换为 UART0 并监听 8888 端口
+    // 硬件连接示意:
+    // D7(RX) <-> Device TX
+    // D8(TX) <-> Device RX
+    // GND    <-> Device GND
+    tcp_bridge_init();
+
     ESP_LOGI(TAG, "System ready.");
 }
