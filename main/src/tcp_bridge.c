@@ -16,25 +16,111 @@ static const char *TAG = "TCP_Bridge";
 #define TCP_PORT 8888
 #define UART_NUM UART_NUM_0
 #define BRIDGE_BAUDRATE 115200
-#define BUF_SIZE 512       // 缓冲区大小
+#define BUF_SIZE 512       // 单次读写临时缓冲区大小
+
+// 离线缓存大小 (8KB)
+// 请根据 ESP8266 剩余内存实际情况调整，太大会导致 malloc 失败
+#define UART_CACHE_SIZE (8 * 1024) 
 
 // === 共享上下文结构体 ===
 typedef struct {
-    int sock;               // 当前连接的 Socket
-    SemaphoreHandle_t exit_sem; // 用于通知连接结束的信号量
-    volatile bool running;  // 运行标志位
+    int sock;               
+    SemaphoreHandle_t exit_sem; 
+    volatile bool running;  
 } bridge_context_t;
 
+// === 环形缓冲区结构 ===
+typedef struct {
+    uint8_t *buffer;
+    size_t size;
+    size_t head; // 写指针
+    size_t tail; // 读指针
+    size_t count;// 当前数据量
+    SemaphoreHandle_t mutex;
+} ringbuf_t;
+
+static ringbuf_t s_rb;
+
+// 初始化环形缓冲区
+static bool rb_init(size_t size) {
+    s_rb.buffer = malloc(size);
+    if (!s_rb.buffer) return false;
+    s_rb.size = size;
+    s_rb.head = 0;
+    s_rb.tail = 0;
+    s_rb.count = 0;
+    s_rb.mutex = xSemaphoreCreateMutex();
+    return true;
+}
+
+// 写入数据 (如果满了，覆盖最旧的数据)
+static void rb_write(const uint8_t *data, size_t len) {
+    if (!s_rb.buffer) return;
+    xSemaphoreTake(s_rb.mutex, portMAX_DELAY);
+    for (size_t i = 0; i < len; i++) {
+        s_rb.buffer[s_rb.head] = data[i];
+        s_rb.head = (s_rb.head + 1) % s_rb.size;
+        
+        if (s_rb.count < s_rb.size) {
+            s_rb.count++;
+        } else {
+            // 缓冲区已满，覆盖旧数据，读指针被迫前移
+            s_rb.tail = (s_rb.tail + 1) % s_rb.size;
+        }
+    }
+    xSemaphoreGive(s_rb.mutex);
+}
+
+// 读取数据
+static int rb_read(uint8_t *dst, int max_len) {
+    if (!s_rb.buffer) return 0;
+    xSemaphoreTake(s_rb.mutex, portMAX_DELAY);
+    int read_cnt = 0;
+    while (read_cnt < max_len && s_rb.count > 0) {
+        dst[read_cnt++] = s_rb.buffer[s_rb.tail];
+        s_rb.tail = (s_rb.tail + 1) % s_rb.size;
+        s_rb.count--;
+    }
+    xSemaphoreGive(s_rb.mutex);
+    return read_cnt;
+}
+
 // ====================================================
-// 任务 1: Socket -> UART (下行数据)
-// 阻塞在 recv 上，收到网络数据立刻写入串口
+// 守护任务: 持续从串口读取数据到环形缓冲区
+// 即使没有 TCP 连接，这个任务也在后台运行
+// ====================================================
+static void uart_rx_daemon_task(void *arg) {
+    uint8_t *tmp_buf = (uint8_t *)malloc(BUF_SIZE);
+    if (!tmp_buf) {
+        ESP_LOGE(TAG, "Daemon malloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "UART Capture Daemon Started (Cache: %d bytes)", UART_CACHE_SIZE);
+
+    while (1) {
+        // 读取串口 (设置较短的超时，保证任务不完全阻塞)
+        // 注意：ESP8266 RTOS SDK 中 portTICK_RATE_MS 可能为 1 或 10
+        int len = uart_read_bytes(UART_NUM, tmp_buf, BUF_SIZE, 20 / portTICK_RATE_MS);
+        if (len > 0) {
+            rb_write(tmp_buf, len);
+        } else {
+            // 没有数据时稍微让出 CPU
+            vTaskDelay(10 / portTICK_RATE_MS);
+        }
+    }
+    free(tmp_buf); // Unreachable
+}
+
+// ====================================================
+// 任务 1: Socket -> UART (下行数据 - 保持原样)
 // ====================================================
 static void tcp_to_uart_task(void *pvParameters) {
     bridge_context_t *ctx = (bridge_context_t *)pvParameters;
     uint8_t *buffer = (uint8_t *)malloc(BUF_SIZE);
     
     if (!buffer) {
-        ESP_LOGE(TAG, "Tx Task malloc failed");
         xSemaphoreGive(ctx->exit_sem);
         vTaskDelete(NULL);
         return;
@@ -43,65 +129,14 @@ static void tcp_to_uart_task(void *pvParameters) {
     ESP_LOGI(TAG, "Task [Net->UART] started");
 
     while (ctx->running) {
-        // 阻塞接收网络数据
         int len = recv(ctx->sock, buffer, BUF_SIZE, 0);
-
         if (len > 0) {
-            // 写入串口
             uart_write_bytes(UART_NUM, (const char *)buffer, len);
         } else {
-            // len == 0 (连接关闭) 或 len < 0 (错误)
-            if (ctx->running) { // 只有在理应运行时才报错
-                ESP_LOGW(TAG, "Socket read failed or disconnected (err: %d)", errno);
+            if (ctx->running) {
+                ESP_LOGW(TAG, "Socket read failed or disconnected");
             }
-            break; // 跳出循环，触发清理
-        }
-    }
-
-    free(buffer);
-    ctx->running = false; // 标记停止，通知另一个任务
-    xSemaphoreGive(ctx->exit_sem); // 释放信号量通知主任务
-    vTaskDelete(NULL);
-}
-
-// ====================================================
-// 任务 2: UART -> Socket (上行数据)
-// 循环读取串口，有数据就发给 Socket
-// ====================================================
-static void uart_to_tcp_task(void *pvParameters) {
-    bridge_context_t *ctx = (bridge_context_t *)pvParameters;
-    uint8_t *buffer = (uint8_t *)malloc(BUF_SIZE);
-    
-    if (!buffer) {
-        ESP_LOGE(TAG, "Rx Task malloc failed");
-        xSemaphoreGive(ctx->exit_sem);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Task [UART->Net] started");
-
-    while (ctx->running) {
-        // 读取串口数据
-        // 设置 100ms 超时，这样即使没有串口数据，也能每 100ms 检查一次 ctx->running 状态
-        // 避免 Socket 断开后，这个任务死锁在 uart_read_bytes 上
-        size_t buffered_len = 0;
-        uart_get_buffered_data_len(UART_NUM, &buffered_len);
-
-        if (buffered_len > 0) {
-            int read_len = uart_read_bytes(UART_NUM, buffer, 
-                                           (buffered_len > BUF_SIZE ? BUF_SIZE : buffered_len), 
-                                           100 / portTICK_RATE_MS);
-            if (read_len > 0) {
-                int sent = send(ctx->sock, buffer, read_len, 0);
-                if (sent < 0) {
-                    ESP_LOGE(TAG, "Socket send failed (errno: %d)", errno);
-                    break;
-                }
-            }
-        } else {
-            // 没有数据，短暂延时检查运行标志
-            vTaskDelay(100 / portTICK_RATE_MS);
+            break; 
         }
     }
 
@@ -112,7 +147,47 @@ static void uart_to_tcp_task(void *pvParameters) {
 }
 
 // ====================================================
-// 主 Server 任务: 接受连接并调度子任务
+// 任务 2: Buffer -> Socket (上行数据 - 已修改)
+// 现在改为从 RingBuffer 读取，而不是直接读串口
+// ====================================================
+static void buffer_to_tcp_task(void *pvParameters) {
+    bridge_context_t *ctx = (bridge_context_t *)pvParameters;
+    uint8_t *buffer = (uint8_t *)malloc(BUF_SIZE);
+    
+    if (!buffer) {
+        xSemaphoreGive(ctx->exit_sem);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Task [Cache->Net] started. Flushing buffer...");
+
+    while (ctx->running) {
+        // 从环形缓冲区取数据
+        int len = rb_read(buffer, BUF_SIZE);
+
+        if (len > 0) {
+            // 发送数据
+            int sent = send(ctx->sock, buffer, len, 0);
+            if (sent < 0) {
+                ESP_LOGE(TAG, "Socket send failed (errno: %d)", errno);
+                break;
+            }
+        } else {
+            // 缓冲区空，等待新数据
+            // 50ms 轮询一次，兼顾响应速度和 CPU 占用
+            vTaskDelay(50 / portTICK_RATE_MS);
+        }
+    }
+
+    free(buffer);
+    ctx->running = false;
+    xSemaphoreGive(ctx->exit_sem);
+    vTaskDelete(NULL);
+}
+
+// ====================================================
+// 主 Server 任务
 // ====================================================
 static void tcp_server_task(void *pvParameters) {
     struct sockaddr_in dest_addr;
@@ -136,7 +211,6 @@ static void tcp_server_task(void *pvParameters) {
         struct sockaddr_in source_addr;
         socklen_t addr_len = sizeof(source_addr);
         
-        // 1. 等待客户端连接
         ESP_LOGI(TAG, "Waiting for client...");
         int sock = accept(listen_sock, (struct sockaddr *)&source_addr, &addr_len);
         if (sock < 0) {
@@ -145,35 +219,27 @@ static void tcp_server_task(void *pvParameters) {
             continue;
         }
         
-        ESP_LOGI(TAG, "Client connected! Spawning tasks.");
+        ESP_LOGI(TAG, "Client connected! Starting tasks.");
 
-        // 2. 初始化会话上下文
         bridge_context_t ctx;
         ctx.sock = sock;
         ctx.running = true;
-        ctx.exit_sem = xSemaphoreCreateCounting(2, 0); // 最多允许两个任务释放
+        ctx.exit_sem = xSemaphoreCreateCounting(2, 0);
 
-        // 3. 创建双向透传任务
-        // 栈大小设为 2048 字节，根据实际情况调整
+        // 创建透传任务
+        // 注意：原 uart_to_tcp 改为 buffer_to_tcp
         xTaskCreate(tcp_to_uart_task, "tcp2uart", 2048, &ctx, 5, NULL);
-        xTaskCreate(uart_to_tcp_task, "uart2tcp", 2048, &ctx, 5, NULL);
+        xTaskCreate(buffer_to_tcp_task, "buf2tcp", 2048, &ctx, 5, NULL);
 
-        // 4. 等待结束信号
-        // 只要有任意一个任务退出（释放信号量），说明连接断开或出错
         xSemaphoreTake(ctx.exit_sem, portMAX_DELAY);
 
         ESP_LOGW(TAG, "Session ending. Cleaning up...");
 
-        // 5. 强制关闭逻辑
-        ctx.running = false; // 通知剩下的那个任务停止
-        
-        // 关闭 Socket 会导致阻塞在 recv() 的 tcp_to_uart_task 立即返回错误并退出
+        ctx.running = false; 
         shutdown(sock, 0);
         close(sock);
 
-        // 稍作延时，确保两个子任务都有时间执行清理并自杀
         vTaskDelay(500 / portTICK_RATE_MS);
-        
         vSemaphoreDelete(ctx.exit_sem);
         ESP_LOGI(TAG, "Cleaned up. Ready for next.");
     }
@@ -182,7 +248,13 @@ static void tcp_server_task(void *pvParameters) {
 }
 
 void tcp_bridge_init(void) {
-    // 1. 配置 UART
+    // 1. 初始化环形缓冲区
+    if (!rb_init(UART_CACHE_SIZE)) {
+        ESP_LOGE(TAG, "Failed to allocate UART cache buffer!");
+        return;
+    }
+
+    // 2. 配置 UART
     uart_config_t uart_config = {
         .baud_rate = BRIDGE_BAUDRATE,
         .data_bits = UART_DATA_8_BITS,
@@ -191,15 +263,18 @@ void tcp_bridge_init(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
     };
     
-    // 安装驱动
-    // TX buffer 设为 0 因为我们是用阻塞写入，RX buffer 设为 1024
+    // 安装驱动 (Rx buffer 1024, Tx buffer 0)
     uart_driver_install(UART_NUM, 1024, 0, 0, NULL, 0);
     uart_param_config(UART_NUM, &uart_config);
 
-    // 2. 关键：交换引脚到 D7(RX) / D8(TX)
+    // 3. 交换引脚
     uart_enable_swap();
     ESP_LOGI(TAG, "UART Swapped: TX->D8(GPIO15), RX->D7(GPIO13)");
 
-    // 3. 启动 Server 主任务
+    // 4. 启动永久运行的串口接收守护任务
+    // 优先级略高于普通任务，防止数据丢失
+    xTaskCreate(uart_rx_daemon_task, "uart_daemon", 2048, NULL, 10, NULL);
+
+    // 5. 启动 TCP Server
     xTaskCreate(tcp_server_task, "bridge_server", 3072, NULL, 5, NULL);
 }
