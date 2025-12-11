@@ -1,0 +1,13 @@
+ESP8266 RTOS Project Template
+Copyright 2025 Wikeolf
+
+-------------------------------------------------------------------------
+This project includes software derived from the ESP8266_RTOS_SDK.
+Source: https://github.com/espressif/ESP8266_RTOS_SDK
+
+The following directories and files are sourced from ESP8266_RTOS_SDK:
+- examples/
+
+Copyright (c) 2018-2021 Espressif Systems (Shanghai) Pte Ltd
+Licensed under the Apache License, Version 2.0.
+-------------------------------------------------------------------------
